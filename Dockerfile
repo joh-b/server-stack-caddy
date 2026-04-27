@@ -2,7 +2,7 @@ ARG CADDY_VERSION=2.11
 
 FROM docker.io/library/caddy:${CADDY_VERSION}-builder AS builder
 RUN xcaddy build \
-    --with github.com/hslatman/caddy-crowdsec-bouncer/http
+    --with github.com/hslatman/caddy-crowdsec-bouncer/
 
 FROM docker.io/library/caddy:${CADDY_VERSION}
 ARG CADDY_UID=10001
