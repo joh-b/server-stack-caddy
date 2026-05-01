@@ -1,10 +1,16 @@
-ARG CADDY_VERSION=2.11
+ARG CADDY_VERSION=2
+ARG CADDY_CROWDSEC_BOUNCER_VERSION=0.8
 
 FROM docker.io/library/caddy:${CADDY_VERSION}-builder AS builder
+
+ARG CADDY_CROWDSEC_BOUNCER_VERSION
+
 RUN xcaddy build \
-    --with github.com/hslatman/caddy-crowdsec-bouncer/
+    --with github.com/hslatman/caddy-crowdsec-bouncer/http@v${CADDY_CROWDSEC_BOUNCER_VERSION} \
+    --with github.com/hslatman/caddy-crowdsec-bouncer/appsec@v${CADDY_CROWDSEC_BOUNCER_VERSION}
 
 FROM docker.io/library/caddy:${CADDY_VERSION}
+
 ARG CADDY_UID=10001
 ARG CADDY_GID=10001
 
@@ -17,6 +23,7 @@ RUN set -eux; \
     chown -R caddy:caddy /data /config /var/log/caddy
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+
 RUN setcap -v cap_net_bind_service=+ep /usr/bin/caddy
 
 USER caddy
