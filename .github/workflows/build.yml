@@ -16,12 +16,85 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
 
+    env:
+      CADDY_MAJOR_VERSION: "2"
+      BOUNCER_MINOR_VERSION: "0.8"
+      MIN_BOUNCER_RELEASE_AGE_DAYS: "7"
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set image name
         run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/server-stack-caddy" >> "$GITHUB_ENV"
+
+      - name: Discover exact versions
+        id: versions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          latest_caddy_version="$(
+            curl -fsSL "https://registry.hub.docker.com/v2/repositories/library/caddy/tags?page_size=100" \
+              | jq -r --arg major "$CADDY_MAJOR_VERSION" '
+                  .results[].name
+                  | select(test("^" + $major + "\\.[0-9]+\\.[0-9]+$"))
+                ' \
+              | sort -V \
+              | tail -n1
+          )"
+
+          if [[ -z "$latest_caddy_version" ]]; then
+            echo "Could not discover latest exact Caddy ${CADDY_MAJOR_VERSION}.x version" >&2
+            exit 1
+          fi
+
+          now_epoch="$(date -u +%s)"
+          min_seconds="$(( MIN_BOUNCER_RELEASE_AGE_DAYS * 24 * 60 * 60 ))"
+
+          latest_bouncer_version="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/hslatman/caddy-crowdsec-bouncer/releases?per_page=50" \
+              | jq -r --arg minor "$BOUNCER_MINOR_VERSION" '
+                  .[]
+                  | select(.draft == false)
+                  | select(.prerelease == false)
+                  | select(.tag_name | test("^v?" + ($minor | gsub("\\."; "\\.")) + "\\.[0-9]+$"))
+                  | [.tag_name, .published_at]
+                  | @tsv
+                ' \
+              | while IFS=$'\t' read -r tag published_at; do
+                  published_epoch="$(date -u -d "$published_at" +%s)"
+                  age_seconds="$(( now_epoch - published_epoch ))"
+
+                  if (( age_seconds >= min_seconds )); then
+                    echo "${tag#v}"
+                    break
+                  fi
+                done
+          )"
+
+          if [[ -z "$latest_bouncer_version" ]]; then
+            echo "Could not find eligible caddy-crowdsec-bouncer ${BOUNCER_MINOR_VERSION}.x release older than ${MIN_BOUNCER_RELEASE_AGE_DAYS} days" >&2
+            exit 1
+          fi
+
+          image_tag="${latest_caddy_version}-crowdsec-${latest_bouncer_version}"
+
+          echo "CADDY_VERSION=${latest_caddy_version}" >> "$GITHUB_ENV"
+          echo "CADDY_CROWDSEC_BOUNCER_VERSION=${latest_bouncer_version}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+
+          echo "caddy_version=${latest_caddy_version}" >> "$GITHUB_OUTPUT"
+          echo "bouncer_version=${latest_bouncer_version}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+
+          echo "Selected Caddy version: ${latest_caddy_version}"
+          echo "Selected caddy-crowdsec-bouncer version: ${latest_bouncer_version}"
+          echo "Selected image tag: ${image_tag}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -30,13 +103,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push 2.11-crowdsec
+      - name: Check whether image already exists
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_ref="${IMAGE_NAME}:${IMAGE_TAG}"
+
+          if docker manifest inspect "$image_ref" >/dev/null 2>&1; then
+            echo "Image already exists: $image_ref"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image does not exist yet: $image_ref"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push custom Caddy image
+        if: steps.existing.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          pull: true
           build-args: |
-            CADDY_VERSION=2.11
+            CADDY_VERSION=${{ env.CADDY_VERSION }}
+            CADDY_CROWDSEC_BOUNCER_VERSION=${{ env.CADDY_CROWDSEC_BOUNCER_VERSION }}
           tags: |
-            ${{ env.IMAGE_NAME }}:2.11-crowdsec
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:${{ env.CADDY_VERSION }}-crowdsec
+            ${{ env.IMAGE_NAME }}:${{ env.CADDY_MAJOR_VERSION }}-crowdsec
+            ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+
+      - name: Report already current
+        if: steps.existing.outputs.should_build == 'false'
+        run: |
+          echo "No build needed."
+          echo "Image already exists: $IMAGE_NAME:$IMAGE_TAG"
