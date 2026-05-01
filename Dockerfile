@@ -7,7 +7,7 @@ ARG CADDY_CROWDSEC_BOUNCER_VERSION
 
 RUN xcaddy build \
     --with github.com/hslatman/caddy-crowdsec-bouncer/http@v${CADDY_CROWDSEC_BOUNCER_VERSION} \
-    --with github.com/hslatman/caddy-crowdsec-bouncer/appsec@v${CADDY_CROWDSEC_BOUNCER_VERSION}
+    --with github.com/hslatman/caddy-crowdsec-bouncer/layer4@v${CADDY_CROWDSEC_BOUNCER_VERSION}
 
 FROM docker.io/library/caddy:${CADDY_VERSION}
 
