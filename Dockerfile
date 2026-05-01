@@ -1,13 +1,12 @@
 ARG CADDY_VERSION=2
-ARG CADDY_CROWDSEC_BOUNCER_VERSION=0.8
+ARG CADDY_CROWDSEC_BOUNCER_VERSION=0
 
 FROM docker.io/library/caddy:${CADDY_VERSION}-builder AS builder
 
 ARG CADDY_CROWDSEC_BOUNCER_VERSION
 
 RUN xcaddy build \
-    --with github.com/hslatman/caddy-crowdsec-bouncer/http@v${CADDY_CROWDSEC_BOUNCER_VERSION} \
-    --with github.com/hslatman/caddy-crowdsec-bouncer/layer4@v${CADDY_CROWDSEC_BOUNCER_VERSION}
+    --with github.com/hslatman/caddy-crowdsec-bouncer@v${CADDY_CROWDSEC_BOUNCER_VERSION}
 
 FROM docker.io/library/caddy:${CADDY_VERSION}
 
