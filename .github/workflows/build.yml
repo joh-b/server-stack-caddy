@@ -18,7 +18,7 @@ jobs:
 
     env:
       CADDY_MAJOR_VERSION: "2"
-      BOUNCER_MINOR_VERSION: "0.8"
+      BOUNCER_MAJOR_VERSION: "0"
       MIN_BOUNCER_RELEASE_AGE_DAYS: "7"
 
     steps:
@@ -57,12 +57,12 @@ jobs:
           latest_bouncer_version="$(
             gh api \
               -H "Accept: application/vnd.github+json" \
-              "/repos/hslatman/caddy-crowdsec-bouncer/releases?per_page=50" \
-              | jq -r --arg minor "$BOUNCER_MINOR_VERSION" '
+              "/repos/hslatman/caddy-crowdsec-bouncer/releases?per_page=100" \
+              | jq -r --arg major "$BOUNCER_MAJOR_VERSION" '
                   .[]
                   | select(.draft == false)
                   | select(.prerelease == false)
-                  | select(.tag_name | test("^v?" + ($minor | gsub("\\."; "\\.")) + "\\.[0-9]+$"))
+                  | select(.tag_name | test("^v?" + $major + "\\.[0-9]+\\.[0-9]+$"))
                   | [.tag_name, .published_at]
                   | @tsv
                 ' \
@@ -78,7 +78,7 @@ jobs:
           )"
 
           if [[ -z "$latest_bouncer_version" ]]; then
-            echo "Could not find eligible caddy-crowdsec-bouncer ${BOUNCER_MINOR_VERSION}.x release older than ${MIN_BOUNCER_RELEASE_AGE_DAYS} days" >&2
+            echo "Could not find eligible caddy-crowdsec-bouncer ${BOUNCER_MAJOR_VERSION}.x release older than ${MIN_BOUNCER_RELEASE_AGE_DAYS} days" >&2
             exit 1
           fi
 
@@ -131,7 +131,6 @@ jobs:
             CADDY_CROWDSEC_BOUNCER_VERSION=${{ env.CADDY_CROWDSEC_BOUNCER_VERSION }}
           tags: |
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            ${{ env.IMAGE_NAME }}:${{ env.CADDY_VERSION }}-crowdsec
             ${{ env.IMAGE_NAME }}:${{ env.CADDY_MAJOR_VERSION }}-crowdsec
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
