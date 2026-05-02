@@ -1,0 +1,121 @@
+name: Watch Docker Hub for Caddy major release
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 06:17 UTC
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch-caddy-v3-dockerhub:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Docker Hub for stable Caddy 3.x tag
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Docker Hub repository-tags endpoint for the official Caddy image.
+          # Official images live under namespace "library".
+          url="https://hub.docker.com/v2/repositories/library/caddy/tags?page_size=100"
+
+          latest_v3="$(
+            curl -fsSL "$url" \
+              | jq -r '
+                  .results[].name
+                  | select(test("^3\\.[0-9]+\\.[0-9]+$"))
+                ' \
+              | sort -V \
+              | tail -n1
+          )"
+
+          if [[ -n "$latest_v3" ]]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "version=$latest_v3" >> "$GITHUB_OUTPUT"
+            echo "Caddy 3 Docker Hub tag found: $latest_v3"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No stable Caddy 3.x Docker Hub tag found."
+          fi
+      - name: Open issue if Caddy 3.x exists
+        if: steps.check.outputs.found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ steps.check.outputs.version }}';
+            const title = `Caddy ${version} is available on Docker Hub`;
+            const labels = ['dependency', 'caddy', 'major-upgrade'];
+
+            const query = [
+              `repo:${context.repo.owner}/${context.repo.repo}`,
+              `is:issue`,
+              `is:open`,
+              `in:title`,
+              `"Caddy ${version} is available on Docker Hub"`
+            ].join(' ');
+
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: query
+            });
+
+            if (existing.data.total_count > 0) {
+              core.info(`Issue already exists for Caddy ${version}`);
+              return;
+            }
+
+            for (const name of labels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color: name === 'major-upgrade' ? 'd73a4a' : '0366d6'
+                });
+              }
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels,
+              body: [
+                `Docker Hub now has a stable Caddy ${version} tag.`,
+                ``,
+                `Your custom image workflow currently tracks Caddy 2.x only:`,
+                ``,
+                '```yaml',
+                'CADDY_MAJOR_VERSION: "2"',
+                '```',
+                ``,
+                `Treat this as a manual migration event, not an automatic update.`,
+                ``,
+                `Checklist:`,
+                ``,
+                `- Read the Caddy 3 release notes`,
+                `- Check Caddyfile compatibility`,
+                `- Check xcaddy/module compatibility`,
+                `- Check caddy-crowdsec-bouncer compatibility`,
+                `- Build the custom image in a test branch`,
+                `- Run caddy validate`,
+                `- Test CrowdSec bouncer behavior`,
+                `- Test ACME behavior`,
+                `- Only then change CADDY_MAJOR_VERSION from "2" to "3"`,
+                ``,
+                `Docker Hub tag detected: \`${version}\``
+              ].join('\n')
+            });
