@@ -12,6 +12,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: custom-caddy-image-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -25,10 +29,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set image name
-        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/server-stack-caddy" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Discover exact versions
+      - name: Set image name
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/server-stack-caddy" >> "$GITHUB_ENV"
+
+      - name: Discover exact versions and upstream digests
         id: versions
         shell: bash
         env:
@@ -36,15 +46,34 @@ jobs:
         run: |
           set -euo pipefail
 
-          latest_caddy_version="$(
-            curl -fsSL "https://registry.hub.docker.com/v2/repositories/library/caddy/tags?page_size=100" \
-              | jq -r --arg major "$CADDY_MAJOR_VERSION" '
-                  .results[].name
-                  | select(test("^" + $major + "\\.[0-9]+\\.[0-9]+$"))
-                ' \
+          discover_latest_caddy_version() {
+            local url
+            local page
+
+            url="https://registry.hub.docker.com/v2/repositories/library/caddy/tags?page_size=100"
+
+            while [[ -n "$url" ]]; do
+              page="$(curl -fsSL "$url")"
+
+              jq -r --arg major "$CADDY_MAJOR_VERSION" '
+                .results[].name
+                | select(test("^" + $major + "\\.[0-9]+\\.[0-9]+$"))
+              ' <<< "$page"
+
+              url="$(jq -r '.next // empty' <<< "$page")"
+            done \
               | sort -V \
               | tail -n1
-          )"
+          }
+
+          get_image_digest() {
+            local image_ref="$1"
+
+            docker buildx imagetools inspect "$image_ref" \
+              | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }'
+          }
+
+          latest_caddy_version="$(discover_latest_caddy_version)"
 
           if [[ -z "$latest_caddy_version" ]]; then
             echo "Could not discover latest exact Caddy ${CADDY_MAJOR_VERSION}.x version" >&2
@@ -56,25 +85,23 @@ jobs:
 
           latest_bouncer_version="$(
             gh api \
+              --paginate \
               -H "Accept: application/vnd.github+json" \
               "/repos/hslatman/caddy-crowdsec-bouncer/releases?per_page=100" \
-              | jq -r --arg major "$BOUNCER_MAJOR_VERSION" '
-                  .[]
-                  | select(.draft == false)
-                  | select(.prerelease == false)
-                  | select(.tag_name | test("^v?" + $major + "\\.[0-9]+\\.[0-9]+$"))
-                  | [.tag_name, .published_at]
-                  | @tsv
-                ' \
-              | while IFS=$'\t' read -r tag published_at; do
-                  published_epoch="$(date -u -d "$published_at" +%s)"
-                  age_seconds="$(( now_epoch - published_epoch ))"
-
-                  if (( age_seconds >= min_seconds )); then
-                    echo "${tag#v}"
-                    break
-                  fi
-                done
+              | jq -r \
+                  --arg major "$BOUNCER_MAJOR_VERSION" \
+                  --argjson now_epoch "$now_epoch" \
+                  --argjson min_seconds "$min_seconds" '
+                    .[]
+                    | select(.draft == false)
+                    | select(.prerelease == false)
+                    | select(.tag_name | test("^v?" + $major + "\\.[0-9]+\\.[0-9]+$"))
+                    | select((.published_at | fromdateiso8601) <= ($now_epoch - $min_seconds))
+                    | .tag_name
+                    | sub("^v"; "")
+                  ' \
+              | sort -V \
+              | tail -n1
           )"
 
           if [[ -z "$latest_bouncer_version" ]]; then
@@ -82,19 +109,55 @@ jobs:
             exit 1
           fi
 
+          caddy_runtime_ref="docker.io/library/caddy:${latest_caddy_version}"
+          caddy_builder_ref="docker.io/library/caddy:${latest_caddy_version}-builder"
+
+          caddy_runtime_digest="$(get_image_digest "$caddy_runtime_ref")"
+          caddy_builder_digest="$(get_image_digest "$caddy_builder_ref")"
+
+          if [[ -z "$caddy_runtime_digest" ]]; then
+            echo "Could not discover digest for ${caddy_runtime_ref}" >&2
+            exit 1
+          fi
+
+          if [[ -z "$caddy_builder_digest" ]]; then
+            echo "Could not discover digest for ${caddy_builder_ref}" >&2
+            exit 1
+          fi
+
+          runtime_digest_short="${caddy_runtime_digest#sha256:}"
+          runtime_digest_short="${runtime_digest_short:0:12}"
+
+          builder_digest_short="${caddy_builder_digest#sha256:}"
+          builder_digest_short="${builder_digest_short:0:12}"
+
           image_tag="${latest_caddy_version}-crowdsec-${latest_bouncer_version}"
+
+          # Marker tag used for scheduled build decisions.
+          # This changes when the selected upstream Caddy version, bouncer version,
+          # Caddy runtime digest, or Caddy builder digest changes.
+          build_key_tag="${image_tag}-upstream-${runtime_digest_short}-${builder_digest_short}"
 
           echo "CADDY_VERSION=${latest_caddy_version}" >> "$GITHUB_ENV"
           echo "CADDY_CROWDSEC_BOUNCER_VERSION=${latest_bouncer_version}" >> "$GITHUB_ENV"
+          echo "CADDY_RUNTIME_DIGEST=${caddy_runtime_digest}" >> "$GITHUB_ENV"
+          echo "CADDY_BUILDER_DIGEST=${caddy_builder_digest}" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+          echo "BUILD_KEY_TAG=${build_key_tag}" >> "$GITHUB_ENV"
 
           echo "caddy_version=${latest_caddy_version}" >> "$GITHUB_OUTPUT"
           echo "bouncer_version=${latest_bouncer_version}" >> "$GITHUB_OUTPUT"
+          echo "caddy_runtime_digest=${caddy_runtime_digest}" >> "$GITHUB_OUTPUT"
+          echo "caddy_builder_digest=${caddy_builder_digest}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${image_tag}" >> "$GITHUB_OUTPUT"
+          echo "build_key_tag=${build_key_tag}" >> "$GITHUB_OUTPUT"
 
           echo "Selected Caddy version: ${latest_caddy_version}"
           echo "Selected caddy-crowdsec-bouncer version: ${latest_bouncer_version}"
+          echo "Selected Caddy runtime image: ${caddy_runtime_ref}@${caddy_runtime_digest}"
+          echo "Selected Caddy builder image: ${caddy_builder_ref}@${caddy_builder_digest}"
           echo "Selected image tag: ${image_tag}"
+          echo "Selected scheduled-build marker tag: ${build_key_tag}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -103,24 +166,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check whether image already exists
-        id: existing
+      - name: Decide whether to build
+        id: build_decision
         shell: bash
         run: |
           set -euo pipefail
 
-          image_ref="${IMAGE_NAME}:${IMAGE_TAG}"
-
-          if docker manifest inspect "$image_ref" >/dev/null 2>&1; then
-            echo "Image already exists: $image_ref"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Image does not exist yet: $image_ref"
+          if [[ "$GITHUB_EVENT_NAME" != "schedule" ]]; then
+            echo "Non-scheduled run; building regardless of existing image tags."
             echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=non-scheduled trigger" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          build_key_ref="${IMAGE_NAME}:${BUILD_KEY_TAG}"
+
+          if docker manifest inspect "$build_key_ref" >/dev/null 2>&1; then
+            echo "Scheduled run: upstream version/digest combination already exists."
+            echo "Existing build marker image: $build_key_ref"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "reason=scheduled run already current" >> "$GITHUB_OUTPUT"
+          else
+            echo "Scheduled run: upstream version/digest combination is new."
+            echo "Missing build marker image: $build_key_ref"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=scheduled upstream change detected" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push custom Caddy image
-        if: steps.existing.outputs.should_build == 'true'
+        if: steps.build_decision.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -130,13 +204,19 @@ jobs:
             CADDY_VERSION=${{ env.CADDY_VERSION }}
             CADDY_CROWDSEC_BOUNCER_VERSION=${{ env.CADDY_CROWDSEC_BOUNCER_VERSION }}
           tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.BUILD_KEY_TAG }}
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
             ${{ env.IMAGE_NAME }}:${{ env.CADDY_MAJOR_VERSION }}-crowdsec
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
 
-      - name: Report already current
-        if: steps.existing.outputs.should_build == 'false'
+      - name: Report build skipped
+        if: steps.build_decision.outputs.should_build == 'false'
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "No build needed."
-          echo "Image already exists: $IMAGE_NAME:$IMAGE_TAG"
+          echo "Reason: ${{ steps.build_decision.outputs.reason }}"
+          echo "Marker image already exists: ${IMAGE_NAME}:${BUILD_KEY_TAG}"
+          echo "Version tag: ${IMAGE_NAME}:${IMAGE_TAG}"
