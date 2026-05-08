@@ -53,7 +53,10 @@ jobs:
             url="https://registry.hub.docker.com/v2/repositories/library/caddy/tags?page_size=100"
 
             while [[ -n "$url" ]]; do
-              page="$(curl -fsSL "$url")"
+              if ! page="$(curl --retry 3 --retry-all-errors --connect-timeout 10 -fsSL "$url")"; then
+                echo "Failed to fetch Docker Hub tag page: $url" >&2
+                return 1
+              fi
 
               jq -r --arg major "$CADDY_MAJOR_VERSION" '
                 .results[].name
@@ -66,14 +69,65 @@ jobs:
               | tail -n1
           }
 
-          get_image_digest() {
-            local image_ref="$1"
+          discover_latest_bouncer_version() {
+            local releases_json
 
-            docker buildx imagetools inspect "$image_ref" \
-              | awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }'
+            if ! releases_json="$(
+              gh api \
+                --paginate \
+                --slurp \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/hslatman/caddy-crowdsec-bouncer/releases?per_page=100"
+            )"; then
+              echo "Failed to fetch caddy-crowdsec-bouncer releases from GitHub API" >&2
+              return 1
+            fi
+
+            jq -r \
+              --arg major "$BOUNCER_MAJOR_VERSION" \
+              --argjson now_epoch "$now_epoch" \
+              --argjson min_seconds "$min_seconds" '
+                flatten
+                | .[]
+                | select(.draft == false)
+                | select(.prerelease == false)
+                | select(.tag_name | test("^v?" + $major + "\\.[0-9]+\\.[0-9]+$"))
+                | select((.published_at | fromdateiso8601) <= ($now_epoch - $min_seconds))
+                | .tag_name
+                | sub("^v"; "")
+              ' <<< "$releases_json" \
+              | sort -V \
+              | tail -n1
           }
 
-          latest_caddy_version="$(discover_latest_caddy_version)"
+          get_image_digest() {
+            local image_ref="$1"
+            local inspect_output
+            local digest
+
+            if ! inspect_output="$(docker buildx imagetools inspect "$image_ref" 2>&1)"; then
+              echo "Failed to inspect image: $image_ref" >&2
+              echo "$inspect_output" >&2
+              return 1
+            fi
+
+            digest="$(
+              awk '$1 == "Digest:" && $2 ~ /^sha256:/ { print $2; exit }' <<< "$inspect_output"
+            )"
+
+            if [[ -z "$digest" ]]; then
+              echo "Could not parse digest from image inspection output for: $image_ref" >&2
+              echo "$inspect_output" >&2
+              return 1
+            fi
+
+            echo "$digest"
+          }
+
+          if ! latest_caddy_version="$(discover_latest_caddy_version)"; then
+            echo "Could not discover latest exact Caddy ${CADDY_MAJOR_VERSION}.x version" >&2
+            exit 1
+          fi
 
           if [[ -z "$latest_caddy_version" ]]; then
             echo "Could not discover latest exact Caddy ${CADDY_MAJOR_VERSION}.x version" >&2
@@ -83,26 +137,10 @@ jobs:
           now_epoch="$(date -u +%s)"
           min_seconds="$(( MIN_BOUNCER_RELEASE_AGE_DAYS * 24 * 60 * 60 ))"
 
-          latest_bouncer_version="$(
-            gh api \
-              --paginate \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/hslatman/caddy-crowdsec-bouncer/releases?per_page=100" \
-              | jq -r \
-                  --arg major "$BOUNCER_MAJOR_VERSION" \
-                  --argjson now_epoch "$now_epoch" \
-                  --argjson min_seconds "$min_seconds" '
-                    .[]
-                    | select(.draft == false)
-                    | select(.prerelease == false)
-                    | select(.tag_name | test("^v?" + $major + "\\.[0-9]+\\.[0-9]+$"))
-                    | select((.published_at | fromdateiso8601) <= ($now_epoch - $min_seconds))
-                    | .tag_name
-                    | sub("^v"; "")
-                  ' \
-              | sort -V \
-              | tail -n1
-          )"
+          if ! latest_bouncer_version="$(discover_latest_bouncer_version)"; then
+            echo "Could not discover latest eligible caddy-crowdsec-bouncer release" >&2
+            exit 1
+          fi
 
           if [[ -z "$latest_bouncer_version" ]]; then
             echo "Could not find eligible caddy-crowdsec-bouncer ${BOUNCER_MAJOR_VERSION}.x release older than ${MIN_BOUNCER_RELEASE_AGE_DAYS} days" >&2
@@ -112,16 +150,11 @@ jobs:
           caddy_runtime_ref="docker.io/library/caddy:${latest_caddy_version}"
           caddy_builder_ref="docker.io/library/caddy:${latest_caddy_version}-builder"
 
-          caddy_runtime_digest="$(get_image_digest "$caddy_runtime_ref")"
-          caddy_builder_digest="$(get_image_digest "$caddy_builder_ref")"
-
-          if [[ -z "$caddy_runtime_digest" ]]; then
-            echo "Could not discover digest for ${caddy_runtime_ref}" >&2
+          if ! caddy_runtime_digest="$(get_image_digest "$caddy_runtime_ref")"; then
             exit 1
           fi
 
-          if [[ -z "$caddy_builder_digest" ]]; then
-            echo "Could not discover digest for ${caddy_builder_ref}" >&2
+          if ! caddy_builder_digest="$(get_image_digest "$caddy_builder_ref")"; then
             exit 1
           fi
 
@@ -134,7 +167,7 @@ jobs:
           image_tag="${latest_caddy_version}-crowdsec-${latest_bouncer_version}"
 
           # Marker tag used for scheduled build decisions.
-          # This changes when the selected upstream Caddy version, bouncer version,
+          # This changes when the selected Caddy version, bouncer version,
           # Caddy runtime digest, or Caddy builder digest changes.
           build_key_tag="${image_tag}-upstream-${runtime_digest_short}-${builder_digest_short}"
 
