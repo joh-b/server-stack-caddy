@@ -93,6 +93,7 @@ jobs:
               repo: context.repo.repo,
               title,
               labels,
+              assignees: ['joh-b'],
               body: [
                 `Docker Hub now has a stable Caddy ${version} tag.`,
                 ``,
