@@ -14,8 +14,22 @@ RUN set -eux; \
     build_dir="$(find /tmp -maxdepth 1 -type d -name 'buildenv_*' -print -quit)"; \
     test -n "$build_dir"; \
     cd "$build_dir"; \
-    go-licenses save --save_path=/licenses --ignore=caddy .; \
-    mkdir -p /licenses/golang.org/go; \
+    go-licenses save \
+        --save_path=/licenses \
+        --ignore=caddy \
+        --ignore=github.com/alecthomas/chroma/v2 \
+        --ignore=github.com/hslatman/ipstore \
+        .; \
+    chroma_dir="$(go list -m -f '{{.Dir}}' github.com/alecthomas/chroma/v2)"; \
+    ipstore_dir="$(go list -m -f '{{.Dir}}' github.com/hslatman/ipstore)"; \
+    bouncer_dir="$(go list -m -f '{{.Dir}}' github.com/hslatman/caddy-crowdsec-bouncer)"; \
+    mkdir -p \
+        /licenses/github.com/alecthomas/chroma/v2 \
+        /licenses/github.com/hslatman/ipstore \
+        /licenses/golang.org/go; \
+    cp "$chroma_dir/COPYING" /licenses/github.com/alecthomas/chroma/v2/COPYING; \
+    cp "$bouncer_dir/LICENSE" /licenses/github.com/hslatman/ipstore/LICENSE; \
+    sed -n '1,15p' "$ipstore_dir/ipstore.go" > /licenses/github.com/hslatman/ipstore/COPYRIGHT; \
     cp /usr/local/go/LICENSE /licenses/golang.org/go/LICENSE
 
 FROM docker.io/library/caddy:${CADDY_VERSION}
