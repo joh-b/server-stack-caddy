@@ -45,7 +45,7 @@ jobs:
           fi
       - name: Open issue if Caddy 3.x exists
         if: steps.check.outputs.found == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const version = '${{ steps.check.outputs.version }}';
